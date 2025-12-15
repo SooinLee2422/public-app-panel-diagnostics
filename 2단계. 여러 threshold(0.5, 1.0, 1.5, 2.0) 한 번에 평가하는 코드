@@ -1,0 +1,76 @@
+import pandas as pd
+from tkinter import Tk
+from tkinter.filedialog import askopenfilename
+
+root = Tk()
+root.withdraw()
+
+print("기본 하이브리드 파일(full_with_hybrid_base.xlsx)을 선택해 주세요.")
+base_path = askopenfilename(
+    title="full_with_hybrid_base 선택",
+    filetypes=[("Excel files", "*.xlsx *.xls")]
+)
+
+print("골든셋 파일(golden_set_7pct_auto.xlsx)을 선택해 주세요.")
+gold_path = askopenfilename(
+    title="golden_set_7pct_auto 선택",
+    filetypes=[("Excel files", "*.xlsx *.xls")]
+)
+
+full = pd.read_excel(base_path)
+gold = pd.read_excel(gold_path)
+
+full['앱ID'] = full['앱ID'].astype(str)
+gold['앱ID'] = gold['앱ID'].astype(str)
+if '성과측정연도' in full.columns and '성과측정연도' in gold.columns:
+    full['성과측정연도'] = pd.to_numeric(full['성과측정연도'], errors='coerce')
+    gold['성과측정연도'] = pd.to_numeric(gold['성과측정연도'], errors='coerce')
+
+# 골든셋 매칭 (앱ID+성과측정연도 기준; 필요시 앱ID만으로 바꿀 수 있음)
+merge_cols = ['앱ID','성과측정연도'] if '성과측정연도' in full.columns else ['앱ID']
+
+gold_sub = gold[merge_cols + ['golden_key']].drop_duplicates()
+full_gold = pd.merge(
+    full,
+    gold_sub,
+    on=merge_cols,
+    how='left'
+)
+
+# threshold 리스트
+thresholds = [0.5, 1.0, 1.5, 2.0]
+
+rows_total = len(full)
+rows_gold = full_gold['golden_key'].notna().sum()
+
+results = []
+
+for th in thresholds:
+    # 전체 coverage
+    mask_total = full['best_score'] >= th
+    cov_total = mask_total.mean()
+
+    # 골든셋 영역
+    gold_mask = full_gold['golden_key'].notna()
+    gold_sub_th = full_gold[gold_mask].copy()
+    gold_sub_th['pred_flag'] = gold_sub_th['best_score'] >= th
+
+    if gold_sub_th['pred_flag'].sum() > 0:
+        acc = (gold_sub_th.loc[gold_sub_th['pred_flag'], 'best_key'] ==
+               gold_sub_th.loc[gold_sub_th['pred_flag'], 'golden_key']).mean()
+    else:
+        acc = float('nan')
+
+    cov_gold = gold_sub_th['pred_flag'].mean()
+
+    results.append({
+        "threshold": th,
+        "전체_coverage": cov_total,
+        "골든셋_coverage": cov_gold,
+        "골든셋_accuracy": acc,
+        "전체_행수": rows_total,
+        "골든셋_행수": rows_gold,
+    })
+
+res_df = pd.DataFrame(results)
+print(res_df)
