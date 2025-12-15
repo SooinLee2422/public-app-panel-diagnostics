@@ -1,0 +1,180 @@
+import pandas as pd
+import re
+import numpy as np
+
+from tkinter import Tk
+from tkinter.filedialog import askopenfilename, asksaveasfilename
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.neighbors import NearestNeighbors
+
+# ========== 0. 파일 선택 ==========
+
+root = Tk()
+root.withdraw()
+
+print("전체 패널 파일(예: 250807_data_24년까지.xlsx)을 선택해 주세요.")
+full_path = askopenfilename(
+    title="전체 패널 파일 선택",
+    filetypes=[("Excel files", "*.xlsx *.xls")]
+)
+
+print("골든셋 파일(예: golden_set_7pct_auto.xlsx)을 선택해 주세요.")
+gold_path = askopenfilename(
+    title="골든셋 파일 선택",
+    filetypes=[("Excel files", "*.xlsx *.xls")]
+)
+
+full = pd.read_excel(full_path)
+gold = pd.read_excel(gold_path)
+
+# ========== 1. 텍스트 전처리 ==========
+
+def normalize_text_simple(s: str) -> str:
+    if pd.isna(s):
+        return ""
+    s = str(s)
+    s = s.lower()
+    s = re.sub(r'\s+', ' ', s)
+    return s.strip()
+
+def build_text(df: pd.DataFrame) -> pd.Series:
+    name = df['앱명'].fillna("").astype(str).apply(normalize_text_simple)
+    org  = df['기관명'].fillna("").astype(str).apply(normalize_text_simple)
+    return name + " [SEP] " + org
+
+full['text'] = build_text(full)
+gold['text'] = build_text(gold)
+
+gold = gold.dropna(subset=['golden_key'])
+gold['golden_key'] = gold['golden_key'].astype(str)
+
+# ========== 2. golden_key별 대표 텍스트 ==========
+
+if '성과측정연도' in gold.columns:
+    rep = gold.sort_values('성과측정연도').groupby('golden_key')['text'].last()
+else:
+    rep = gold.groupby('golden_key')['text'].first()
+
+rep_keys = rep.index.tolist()
+rep_texts = rep.values.tolist()
+
+# ========== 3. TF-IDF + 최근접 이웃 ==========
+
+tfidf = TfidfVectorizer(ngram_range=(1,2), min_df=1)
+tfidf.fit(rep_texts)
+
+rep_vecs = tfidf.transform(rep_texts)
+full_vecs = tfidf.transform(full['text'])
+
+K = 5
+nn = NearestNeighbors(n_neighbors=K, metric='cosine')
+nn.fit(rep_vecs)
+
+distances, indices = nn.kneighbors(full_vecs)
+similarities = 1 - distances
+
+# ========== 4. 규칙 기반 스코어 계산 (threshold 없이 best만 저장) ==========
+
+def normalize_strict(s: str) -> str:
+    if pd.isna(s):
+        return ""
+    s = str(s)
+    s = s.lower()
+    s = re.sub(r'\s+', '', s)
+    s = re.sub(r'[\.\,\-\_\:\;\[\]\(\)·…“”\'\"!?\+\/]', '', s)
+    return s
+
+full['앱명_norm'] = full['앱명'].astype(str).apply(normalize_strict)
+full['기관_norm'] = full['기관명'].astype(str).apply(normalize_strict)
+full['앱ID'] = full['앱ID'].astype(str)
+
+gold_rep_df = pd.DataFrame({
+    'golden_key': rep_keys,
+    'text': rep_texts
+})
+gold_rep_df['앱명_rep'] = gold_rep_df['text'].apply(
+    lambda x: x.split("[SEP]")[0].strip()
+)
+gold_rep_df['기관_rep'] = gold_rep_df['text'].apply(
+    lambda x: x.split("[SEP]")[1].strip() if "[SEP]" in x else ""
+)
+gold_rep_df['앱명_norm_rep'] = gold_rep_df['앱명_rep'].apply(normalize_strict)
+gold_rep_df['기관_norm_rep'] = gold_rep_df['기관_rep'].apply(normalize_strict)
+
+rep_info = gold_rep_df.set_index('golden_key').to_dict(orient='index')
+
+appid_golden = gold[['앱ID','golden_key']].dropna().astype(str).drop_duplicates()
+appid2gset = (
+    appid_golden.groupby('앱ID')['golden_key']
+    .apply(set)
+    .to_dict()
+)
+
+def jaccard_tokens(a: str, b: str) -> float:
+    ta = set(a.split())
+    tb = set(b.split())
+    if not ta and not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+best_keys = []
+best_scores = []
+
+for i in range(len(full)):
+    cand_idx = indices[i]
+    cand_sims = similarities[i]
+    cand_keys = [rep_keys[j] for j in cand_idx]
+
+    name = normalize_text_simple(full.loc[i, '앱명'])
+    org  = normalize_text_simple(full.loc[i, '기관명'])
+    name_norm = full.loc[i, '앱명_norm']
+    org_norm  = full.loc[i, '기관_norm']
+    appid = full.loc[i, '앱ID']
+
+    best_score = -999
+    best_key = None
+
+    for gk, sim in zip(cand_keys, cand_sims):
+        info = rep_info[gk]
+        rep_name = normalize_text_simple(info['앱명_rep'])
+        rep_org  = normalize_text_simple(info['기관_rep'])
+        rep_name_norm = info['앱명_norm_rep']
+        rep_org_norm  = info['기관_norm_rep']
+
+        name_eq = 1.0 if name_norm == rep_name_norm and name_norm != "" else 0.0
+        org_eq  = 1.0 if org_norm == rep_org_norm and org_norm != "" else 0.0
+        name_jac = jaccard_tokens(name, rep_name)
+        appid_match = 1.0 if (appid in appid2gset and gk in appid2gset[appid]) else 0.0
+
+        score = 0.0
+        score += 2.0 * name_eq
+        score += 1.5 * org_eq
+        score += 1.0 * name_jac
+        score += 1.0 * float(sim)
+        score += 1.0 * appid_match
+
+        if score > best_score:
+            best_score = score
+            best_key = gk
+
+    best_keys.append(best_key)
+    best_scores.append(best_score)
+
+full['best_key'] = best_keys
+full['best_score'] = best_scores
+
+print("best_score 기준 최소/최대:", full['best_score'].min(), full['best_score'].max())
+
+save_path = asksaveasfilename(
+    title="기본 하이브리드 점수 저장",
+    defaultextension=".xlsx",
+    initialfile="full_with_hybrid_base.xlsx",
+    filetypes=[("Excel files", "*.xlsx")]
+)
+
+if save_path:
+    full.to_excel(save_path, index=False)
+    print("저장 완료:", save_path)
+else:
+    print("저장 취소")
