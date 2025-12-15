@@ -1,0 +1,147 @@
+import pandas as pd
+from tkinter import Tk
+from tkinter.filedialog import askopenfilename, asksaveasfilename
+
+# -------------------------------------
+# 1. 파일 선택 (마우스 클릭)
+# -------------------------------------
+root = Tk()
+root.withdraw()
+
+print("하이브리드 키가 포함된 full 파일을 선택하세요.")
+full_path = askopenfilename(
+    title="full_with_hybrid_key 파일 선택",
+    filetypes=[("Excel files", "*.xlsx")]
+)
+
+print("골든셋 파일을 선택하세요.")
+gold_path = askopenfilename(
+    title="golden_set 파일 선택",
+    filetypes=[("Excel files", "*.xlsx")]
+)
+
+full = pd.read_excel(full_path)
+gold = pd.read_excel(gold_path)
+
+print("\n[INFO] 파일 로드 완료\n")
+
+
+# -------------------------------------
+# 2. golden_key merge 준비
+# -------------------------------------
+
+# 타입 정리
+full['앱ID'] = full['앱ID'].astype(str)
+gold['앱ID'] = gold['앱ID'].astype(str)
+
+# 골든셋 중복 제거 (앱ID+성과측정연도 기준)
+gold2 = (
+    gold.sort_values(['앱ID','성과측정연도'])
+        .drop_duplicates(['앱ID','성과측정연도'], keep='first')
+)
+
+# merge
+merged = pd.merge(
+    full,
+    gold2[['앱ID','성과측정연도','golden_key']],
+    on=['앱ID','성과측정연도'],
+    how='left'
+)
+
+print("[INFO] 골든셋 병합 완료\n")
+
+
+# -------------------------------------
+# 3. 오류 유형 분석은 golden_key 있는 행만 대상으로 함
+# -------------------------------------
+g = merged[merged['golden_key'].notna()].copy()
+
+# split: 동일 golden_key가 여러 앱ID에 존재
+gid_to_appids = g.groupby('golden_key')['앱ID'].nunique()
+split_keys = gid_to_appids[gid_to_appids > 1].index
+g['is_split'] = g['golden_key'].isin(split_keys)
+
+# merge: 동일 앱ID에 서로 다른 golden_key가 존재
+app_to_gids = g.groupby('앱ID')['golden_key'].nunique()
+merge_apps = app_to_gids[app_to_gids > 1].index
+g['is_merge'] = g['앱ID'].isin(merge_apps)
+
+# hybrid 불러오기
+g['agree_hybrid'] = (g['golden_key'].astype(str) == g['hybrid_key'].astype(str))
+g['has_hybrid'] = g['hybrid_key'].notna()
+
+
+# -------------------------------------
+# 4. 오류 유형 자동 분류 함수
+# -------------------------------------
+def classify_row(row):
+    split = row['is_split']
+    merge = row['is_merge']
+    agree = row['agree_hybrid']
+    has_h = row['has_hybrid']
+
+    # 정상적인 App-ID 구조
+    if not split and not merge:
+        if agree:
+            return "OK_all_agree"
+        elif has_h:
+            return "OK_AppID_vs_golden, hybrid_mismatch"
+        else:
+            return "OK_AppID_vs_golden, hybrid_missing"
+
+    # 분할 오류(split)
+    if split and not merge:
+        if agree:
+            return "split_error, hybrid_follows_golden"
+        elif has_h:
+            return "split_error, hybrid_other"
+        else:
+            return "split_error, hybrid_missing"
+
+    # 통합 오류(merge)
+    if not split and merge:
+        if agree:
+            return "merge_error, hybrid_follows_golden"
+        elif has_h:
+            return "merge_error, hybrid_other"
+        else:
+            return "merge_error, hybrid_missing"
+
+    # split + merge 동시에 존재하는 복합 오류
+    if agree:
+        return "split+merge_error, hybrid_follows_golden"
+    elif has_h:
+        return "split+merge_error, hybrid_other"
+    else:
+        return "split+merge_error, hybrid_missing"
+
+# error_type 컬럼 만들기
+g['error_type'] = g.apply(classify_row, axis=1)
+
+print("[INFO] 오류 유형 분류 완료\n")
+
+
+# -------------------------------------
+# 5. 간단 요약 출력
+# -------------------------------------
+print("총 골든셋 행:", len(g))
+print("\n오류 유형별 빈도:")
+print(g['error_type'].value_counts())
+print("\n")
+
+
+# -------------------------------------
+# 6. 결과 저장 (마우스 클릭)
+# -------------------------------------
+save_path = asksaveasfilename(
+    title="오류 유형 결과 저장",
+    defaultextension=".xlsx",
+    initialfile="golden_zone_with_error_types.xlsx",
+    filetypes=[("Excel files", "*.xlsx")]
+)
+
+if save_path:
+    g.to_excel(save_path, index=False)
+    print(f"[INFO] 저장 완료: {save_path}")
+else:
+    print("[INFO] 저장 취소됨")
